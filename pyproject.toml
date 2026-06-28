@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cube"
 version = "0.1"
-requires-python = ">=3.7"
+requires-python = ">=3.11"
 description = "A generative 3D model to accelerate the creation of 3D assets, accessories, and experiences."
 authors = [
     { name = "Foundation AI", email = "foundationai@roblox.com" }
@@ -14,7 +14,7 @@ keywords = ["cube"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
 ]
 dependencies = [
     "numpy",
@@ -33,6 +33,6 @@ meshlab = ["pymeshlab"]
 lint = ["ruff==0.9.10"]
 
 [tool.setuptools.packages.find]
-where = ["cube3d"]
-include = ["cube/*"]
+where = ["."]
+include = ["cube3d*"]
 namespaces = false
