@@ -78,7 +78,6 @@ class Engine:
         self.min_id = 0
         self.max_id = self.shape_model.cfg.num_codes
 
-    @torch.inference_mode()
     def prepare_conditions_with_bbox(
         self,
         cond: torch.Tensor,
@@ -112,7 +111,6 @@ class Engine:
         cond = torch.cat([cond, bbox_emb], dim=1)
         return cond
 
-    @torch.inference_mode()
     def prepare_inputs(
         self,
         prompts: list[str],
@@ -154,7 +152,6 @@ class Engine:
 
         return embed, cond
 
-    @torch.inference_mode()
     def run_clip(self, text_inputs):
         """
         Processes the given text inputs using a text tokenizer and a text model, and returns the encoded text embeddings.
@@ -184,7 +181,6 @@ class Engine:
 
         return embed
 
-    @torch.inference_mode()
     def encode_input(self, inputs: torch.Tensor, bos: int):
         """
         Encodes the beginning of sequence (BOS) token for the given input tensor.
@@ -206,6 +202,39 @@ class Engine:
         )
         return bos_embed
 
+    def _broadcast_cond(self, cond: torch.Tensor, batch_size: int) -> torch.Tensor:
+        cond = cond.to(self.device)
+        if cond.shape[0] != batch_size:
+            cond = cond.expand(batch_size, -1, -1)
+        return cond
+
+    def _encode_prefill(
+        self,
+        prefill_token_ids: Optional[list[torch.Tensor]],
+        guidance_scale: float = 0.0,
+    ) -> Tuple[Optional[torch.Tensor], int]:
+        """
+        Encodes known shape-token ids into embeddings for seeding the context window before
+        BOS.
+
+        Args:
+            prefill_token_ids: known shape-token id tensors, concatenated along the sequence dim
+                in order. None/empty means no prefill.
+            guidance_scale: if > 0, doubles the batch dim to match the [cond; uncond] batch that
+                prepare_inputs produces for classifier-free guidance. Training never uses CFG, so
+                callers there should leave this at 0.0.
+        Returns:
+            (prefill_embeds, n_prefill_tokens): prefill_embeds is None if no prefill was given.
+        """
+        if not prefill_token_ids:
+            return None, 0
+        prefill_embeds = torch.cat(
+            [self.gpt_model.encode_token(t) for t in prefill_token_ids], dim=1
+        )
+        if guidance_scale > 0.0:
+            prefill_embeds = torch.cat([prefill_embeds, prefill_embeds], dim=0)
+        return prefill_embeds, prefill_embeds.shape[1]
+
     @torch.inference_mode()
     def run_gpt(
         self,
@@ -214,6 +243,8 @@ class Engine:
         guidance_scale: float = 3.0,
         top_p: float = None,
         bounding_box_xyz: Optional[Tuple[float]] = None,
+        prefill_token_ids: Optional[list[torch.Tensor]] = None,
+        cond: Optional[torch.Tensor] = None,
     ):
         """
         Generates text using a GPT model based on the provided prompts.
@@ -226,43 +257,67 @@ class Engine:
             bounding_box_xyz (Optional[Tuple[float]], optional): The size of the bounding box for generation
                 as (x, y, z) dimensions. Each value must be between 0 and 1.925. If None,
                 uses default bounding box sizing.
+            prefill_token_ids (Optional[list[torch.Tensor]], optional): Known shape-token id
+                tensors to seed the context window with, in order, immediately after the BOS token
+                Default is None, i.e. generation starts from BOS only.
+            cond (Optional[torch.Tensor], optional): Precomputed conditioning embeddings to reuse
+                instead of running the text encoder. Requires guidance_scale == 0.0 (no CFG).
         Returns:
             torch.Tensor: A tensor containing the generated token IDs.
         """
-        embed, cond = self.prepare_inputs(prompts, guidance_scale, bounding_box_xyz)
+        if cond is None:
+            embed, cond = self.prepare_inputs(prompts, guidance_scale, bounding_box_xyz)
+        else:
+            assert guidance_scale == 0.0, "precomputed cond requires guidance_scale == 0.0"
+            cond = self._broadcast_cond(cond, len(prompts))
+            embed = self.encode_input(cond, self.gpt_model.shape_bos_id)
 
         output_ids = []
 
         batch_size, input_seq_len, dim = embed.shape
-        max_seq_len = input_seq_len + self.max_new_tokens
+
+        if prefill_token_ids:
+            output_ids.extend(prefill_token_ids)
+        prefill_embeds, n_prefill_tokens = self._encode_prefill(
+            prefill_token_ids, guidance_scale
+        )
+
+        ctx_len = input_seq_len + n_prefill_tokens
+        max_seq_len = ctx_len + self.max_new_tokens
         embed_buffer = torch.zeros(
             (batch_size, max_seq_len, dim), dtype=embed.dtype, device=embed.device
         )
         embed_buffer[:, :input_seq_len, :].copy_(embed)
+        if prefill_embeds is not None:
+            embed_buffer[:, input_seq_len:ctx_len, :].copy_(prefill_embeds)
+
         cond_len = cond.shape[1]
         kv_cache = None
         if use_kv_cache:
             kv_cache = self.gpt_model.init_kv_cache(
                 batch_size,
                 cond_len,
-                self.max_new_tokens + 1,  # +1 for the BOS token
+                max_seq_len,  # ctx_len (BOS + prefill) + newly generated tokens
                 torch.bfloat16,
                 embed.device,
             )
+
         with torch.autocast(self.device.type, dtype=torch.bfloat16):
             for i in tqdm(range(self.max_new_tokens), desc=f"generating"):
-                curr_pos_id = torch.tensor([i], dtype=torch.long, device=embed.device)
+                query_pos = ctx_len - 1 + i
+                curr_pos_id = torch.tensor(
+                    [query_pos], dtype=torch.long, device=embed.device
+                )
+                decode = (i > 0) if use_kv_cache else False
                 logits = self.gpt_model(
                     embed_buffer,
                     cond,
                     kv_cache=kv_cache,
                     curr_pos_id=curr_pos_id if use_kv_cache else None,
-                    decode=(i > 0) if use_kv_cache else False,
+                    decode=decode,
                 )
-                if use_kv_cache:
-                    logits = logits[:, 0, ...]
-                else:
-                    logits = logits[:, i, ...]
+
+                logits = logits[:, 0, ...] if decode else logits[:, query_pos, ...]
 
                 logits = logits[..., self.min_id : self.max_id]
 
@@ -280,9 +335,61 @@ class Engine:
                 next_embed = self.gpt_model.encode_token(next_id)
                 if guidance_scale > 0.0:
                     next_embed = torch.cat([next_embed, next_embed], dim=0)
-                embed_buffer[:, i + input_seq_len, :].copy_(next_embed.squeeze(1))
+                embed_buffer[:, ctx_len + i, :].copy_(next_embed.squeeze(1))
 
         return torch.cat(output_ids, dim=1)
+
+    def predict_logits(
+        self,
+        prompts: list[str],
+        target_token_ids: torch.Tensor,
+        prefill_token_ids: Optional[list[torch.Tensor]] = None,
+        bounding_box_xyz: Optional[Tuple[float]] = None,
+        cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Run the GPT model in parallel with teacher-forcing.
+        Args:
+            prompts (list[str]): Text prompts, batch size matches `target_token_ids`.
+            target_token_ids (torch.Tensor): Ground-truth shape token ids to teacher-force and
+                score against, shape [batch, self.max_new_tokens].
+            prefill_token_ids (Optional[list[torch.Tensor]], optional): Known shape-token id
+                tensors to seed the context with before`target_token_ids`.
+            bounding_box_xyz (Optional[Tuple[float]], optional): See run_gpt.
+            cond (Optional[torch.Tensor], optional): Precomputed conditioning embeddings to reuse
+                instead of running the text encoder, broadcast to the target batch. When given,
+                `prompts` is ignored (used to evict CLIP for a fixed prompt).
+        Returns:
+            torch.Tensor: logits of shape [batch, self.max_new_tokens, num_codes], aligned
+            position-for-position with target_token_ids (logits[:, k] predicts target_token_ids[:, k]).
+        """
+        if cond is None:
+            embed, cond = self.prepare_inputs(
+                prompts, guidance_scale=0.0, bounding_box_xyz=bounding_box_xyz
+            )
+        else:
+            cond = self._broadcast_cond(cond, target_token_ids.shape[0])
+            embed = self.encode_input(cond, self.gpt_model.shape_bos_id)
+        batch_size, input_seq_len, dim = embed.shape
+
+        prefill_embeds, n_prefill_tokens = self._encode_prefill(prefill_token_ids)
+        ctx_len = input_seq_len + n_prefill_tokens
+
+        target_embeds = self.gpt_model.encode_token(target_token_ids)
+
+        context_parts = [embed]
+        if prefill_embeds is not None:
+            context_parts.append(prefill_embeds)
+        # the last target token has nothing left to predict, so it's never fed as input
+        context_parts.append(target_embeds[:, :-1, :])
+        input_embeds = torch.cat(context_parts, dim=1)
+
+        logits = self.gpt_model(
+            input_embeds, cond, kv_cache=None, curr_pos_id=None, decode=False
+        )
+        logits = logits[:, ctx_len - 1 :, :]
+        logits = logits[..., self.min_id : self.max_id]
+        return logits
 
     @torch.inference_mode()
     def run_shape_decode(
@@ -293,6 +400,7 @@ class Engine:
     ):
         """
         Decodes the shape from the given output IDs and extracts the geometry.
+
         Args:
             output_ids (torch.Tensor): The tensor containing the output IDs.
             resolution_base (float, optional): The base resolution for geometry extraction. Defaults to 8.43.
@@ -301,9 +409,9 @@ class Engine:
             tuple: A tuple containing the vertices and faces of the mesh.
         """
         shape_ids = (
-            output_ids[:, : self.shape_model.cfg.num_encoder_latents, ...]
+            output_ids[:, -self.max_new_tokens :, ...]
             .clamp_(0, self.shape_model.cfg.num_codes - 1)
-            .view(-1, self.shape_model.cfg.num_encoder_latents)
+            .view(-1, self.max_new_tokens)
         )
         latents = self.shape_model.decode_indices(shape_ids)
         mesh_v_f, _ = self.shape_model.extract_geometry(
