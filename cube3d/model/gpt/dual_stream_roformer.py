@@ -219,10 +219,6 @@ class DualStreamRoformer(nn.Module):
         s = cond.shape[1]
         device = embed.device
 
-        attn_mask = torch.tril(
-            torch.ones(s + l, s + l, dtype=torch.bool, device=device)
-        )
-
         position_ids = torch.arange(l, dtype=torch.long, device=device)  # shape (t)
         position_ids = position_ids.unsqueeze_(0).expand(b, -1)
 
@@ -252,13 +248,35 @@ class DualStreamRoformer(nn.Module):
         h = embed
         c = cond
 
+        # The kv-cache inference path (prefill + decode) indexes an explicit tril mask by
+        # global position and relies on it to hide unwritten cache slots, so it must keep the
+        # original full mask. Only the full-sequence training forward (kv_cache is None) drops
+        # the mask to unlock flash attention via is_causal.
+        if kv_cache is None:
+            cache_mask = None
+        else:
+            cache_mask = torch.tril(
+                torch.ones(s + l, s + l, dtype=torch.bool, device=device)
+            )
+
         layer_idx = 0
         for block in self.transformer.dual_blocks:
+            if cache_mask is not None:
+                dual_mask = cache_mask
+            elif block.attn.cond_pre_only:
+                # is_causal=True uses top-left alignment when q is shorter than k, which would
+                # hide the cond prefix from this block's shape-only query; it needs an explicit
+                # bottom-right-aligned mask instead.
+                key_pos = torch.arange(s + l, device=device)
+                query_pos = torch.arange(l, device=device)
+                dual_mask = key_pos.unsqueeze(0) <= (s + query_pos).unsqueeze(1)
+            else:
+                dual_mask = None
             h, c = block(
                 h,
                 c=c,
                 freqs_cis=d_freqs_cis,
-                attn_mask=attn_mask,
+                attn_mask=dual_mask,
                 is_causal=True,
                 kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
                 curr_pos_id=curr_pos_id + s if curr_pos_id is not None else None,
