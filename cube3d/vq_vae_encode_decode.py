@@ -22,7 +22,7 @@ def rescale(vertices: np.ndarray, mesh_scale: float = MESH_SCALE) -> np.ndarray:
     return vertices
 
 
-def load_scaled_mesh(file_path: str) -> trimesh.Trimesh:
+def    load_scaled_mesh(file_path: str) -> trimesh.Trimesh:
     """
     Load a mesh and scale it to a unit cube, and clean the mesh.
     Parameters:
