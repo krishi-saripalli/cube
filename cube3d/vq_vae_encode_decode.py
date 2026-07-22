@@ -59,10 +59,7 @@ def growth_factor(base: np.ndarray, edited: np.ndarray) -> float:
 
 
 def derived_fill(growth: float, margin: float, fill_floor: float) -> float:
-    """Cube fraction to draw a base at so its edited partner fits: ``1 / (margin * growth)``.
-
-    Clamped to ``[fill_floor, 1]``. ``margin > 1`` pads for the base-vs-edited growth
-    mismatch; ``growth`` below 1 (a shrinking edit) is treated as 1 (no headroom needed).
+    """Fraction of the calculated cube to draw an unedited shape at so its edited partner fits: ``1 / (margin * growth)``.
     """
     return float(min(1.0, max(fill_floor, 1.0 / (margin * max(growth, 1.0)))))
 

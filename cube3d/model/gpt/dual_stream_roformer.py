@@ -20,6 +20,7 @@ class DualStreamRoformer(nn.Module):
         n_layer: int = 12
         n_single_layer: int = 0
         rope_theta: float = 1000
+        long_context_multiplier: float | None = None
 
         n_head: int = 16
         n_embd: int = 2048
@@ -61,6 +62,7 @@ class DualStreamRoformer(nn.Module):
         super().__init__()
 
         self.cfg = cfg
+        self.ntk_aware_rope = False
 
         self.text_proj = nn.Linear(
             in_features=self.cfg.text_model_embed_dim,
@@ -221,11 +223,15 @@ class DualStreamRoformer(nn.Module):
 
         position_ids = torch.arange(l, dtype=torch.long, device=device)  # shape (t)
         position_ids = position_ids.unsqueeze_(0).expand(b, -1)
+        long_context_multiplier = (
+            self.cfg.long_context_multiplier if self.ntk_aware_rope else None
+        )
 
         s_freqs_cis = precompute_freqs_cis(
             dim=self.cfg.n_embd // self.cfg.n_head,
             t=position_ids,
             theta=self.cfg.rope_theta,
+            long_context_multiplier=long_context_multiplier,
         )
 
         position_ids = torch.cat(
@@ -239,6 +245,7 @@ class DualStreamRoformer(nn.Module):
             dim=self.cfg.n_embd // self.cfg.n_head,
             t=position_ids,
             theta=self.cfg.rope_theta,
+            long_context_multiplier=long_context_multiplier,
         )
 
         if kv_cache is not None and decode:

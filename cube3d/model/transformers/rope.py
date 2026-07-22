@@ -32,13 +32,14 @@ def apply_rotary_emb(
 
 
 @torch.no_grad
-def precompute_freqs_cis(dim: int, t: torch.Tensor, theta: float = 10000.0):
+def precompute_freqs_cis(dim: int, t: torch.Tensor, theta: float = 10000.0, long_context_multiplier: float | None = None):
     """Calculate rotary embedding cos & sin, this is useful when every blocks in the network use same positional embedding.
 
     Args:
         dim (int): dimension of the single head of the transformer block
         t (torch.Tensor): position ids [..., L]
         theta (int, optional): rope theta. Defaults to 10000.
+        long_context_multiplier (float | None, optional): long context multiplier used for NTK-aware Rope.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: tuple of cos and sin of rope
@@ -46,6 +47,8 @@ def precompute_freqs_cis(dim: int, t: torch.Tensor, theta: float = 10000.0):
     assert dim % 2 == 0, (
         "RoPE only supports embedding dimensions that are multiples of 2"
     )
+    if long_context_multiplier is not None:
+        theta = theta * long_context_multiplier ** (dim / (dim - 2))
     freqs = 1.0 / (
         theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=t.device) / dim)
     )
