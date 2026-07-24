@@ -96,7 +96,6 @@ def load_scaled_mesh_pair(
 
 
 def _sample_point_cloud(mesh: trimesh.Trimesh, n_samples: int) -> torch.Tensor:
-    """Sample points + normals from a mesh surface into a (1, n_samples, 6) tensor."""
     positions, face_indices = trimesh.sample.sample_surface(mesh, n_samples)
     normals = mesh.face_normals[face_indices]
     point_cloud = np.concatenate([positions, normals], axis=1)
