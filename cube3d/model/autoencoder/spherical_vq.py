@@ -142,18 +142,19 @@ class SphericalVectorQuantizer(nn.Module):
                     - "perplexity" (torch.Tensor): The perplexity of the quantization,
                       calculated as the exponential of the negative sum of the
                       probabilities' log values.
+                - z_e_norm (torch.Tensor): The pre-quantized, normalized latent representation.
         """
 
         with torch.autocast(device_type=z.device.type, enabled=False):
             # work in full precision
-            z = z.float()
+            z = z.float() # this is z_e
 
             # project and normalize
-            z_e = self.norm(self.c_in(z))
-            z_q, ret_dict = self.quantize(z_e)
+            z_e_norm = self.norm(self.c_in(z))
+            z_q, ret_dict = self.quantize(z_e_norm)
 
             ret_dict["z_q"] = z_q.detach()
-            z_q = self.straight_through_approximation(z_e, z_q)
+            z_q = self.straight_through_approximation(z_e_norm, z_q)
             z_q = self.c_out(z_q)
 
-        return z_q, ret_dict
+        return z_q, ret_dict, z_e_norm

@@ -110,7 +110,7 @@ class Engine:
         prompts: list[str],
         guidance_scale: float,
         bounding_box_xyz: Optional[Tuple[float]] = None,
-        text_cond: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ):
         """
         Prepares the input embeddings for the model based on the provided prompts and guidance scale.
@@ -120,18 +120,19 @@ class Engine:
             bounding_box_xyz (Optional[Tuple[float]], optional): The size of the bounding box for generation
                 as (x, y, z) dimensions. Each value must be between 0 and 1.925. If None,
                 uses default bounding box sizing.
+            cond (Optional[torch.Tensor], optional): Precomputed conditioning embeddings to reuse.
         Returns:
             tuple: A tuple containing:
                 - embed (torch.Tensor): The encoded input embeddings.
                 - cond (torch.Tensor): The condition embeddings, which may include unconditional embeddings if guidance_scale is greater than 0.0.
         """
 
-        if text_cond is not None:
+        if cond is not None:
             assert guidance_scale == 0.0
-            assert text_cond.shape[0] == len(prompts)
+            assert cond.shape[0] == len(prompts)
             with torch.autocast(self.device.type, dtype=torch.bfloat16):
-                embed = self.encode_input(text_cond, self.gpt_model.shape_bos_id)
-            return embed, text_cond
+                embed = self.encode_input(cond, self.gpt_model.shape_bos_id)
+            return embed, cond
 
         prompt_embeds = self.run_clip(prompts)
 
@@ -248,7 +249,7 @@ class Engine:
         top_p: float = None,
         bounding_box_xyz: Optional[Tuple[float]] = None,
         prefill_token_ids: Optional[list[torch.Tensor]] = None,
-        text_cond: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ):
         """
         Generates text using a GPT model based on the provided prompts.
@@ -264,18 +265,18 @@ class Engine:
             prefill_token_ids (Optional[list[torch.Tensor]], optional): Known shape-token id
                 tensors to seed the context window with, in order, immediately after the BOS token
                 Default is None, i.e. generation starts from BOS only.
-            text_cond (Optional[torch.Tensor], optional): Precomputed conditioning embeddings to reuse
+            cond (Optional[torch.Tensor], optional): Precomputed conditioning embeddings to reuse
                 instead of running the text encoder, with batch size len(prompts). Requires
                 guidance_scale == 0.0 (no CFG).
         Returns:
             torch.Tensor: A tensor containing the generated token IDs.
         """
-        if text_cond is None:
-            embed, text_cond = self.prepare_inputs(prompts, guidance_scale, bounding_box_xyz)
+        if cond is None:
+            embed, cond = self.prepare_inputs(prompts, guidance_scale, bounding_box_xyz)
         else:
             assert guidance_scale == 0.0, "precomputed cond requires guidance_scale == 0.0"
-            assert text_cond.shape[0] == len(prompts)
-            embed = self.encode_input(text_cond, self.gpt_model.shape_bos_id)
+            assert cond.shape[0] == len(prompts)
+            embed = self.encode_input(cond, self.gpt_model.shape_bos_id)
 
         output_ids = []
 
@@ -296,12 +297,12 @@ class Engine:
         if prefill_embeds is not None:
             embed_buffer[:, input_seq_len:input_ctx_len, :].copy_(prefill_embeds)
 
-        text_cond_len = text_cond.shape[1]
+        cond_len = cond.shape[1]
         kv_cache = None
         if use_kv_cache:
             kv_cache = self.gpt_model.init_kv_cache(
                 batch_size,
-                text_cond_len,
+                cond_len,
                 max_seq_len,  # input_ctx_len (BOS + prefill) + max allowed output tokens
                 torch.bfloat16,
                 embed.device,
@@ -316,7 +317,7 @@ class Engine:
                 decode = (i > 0) if use_kv_cache else False
                 logits = self.gpt_model(
                     embed_buffer,
-                    text_cond,
+                    cond,
                     kv_cache=kv_cache,
                     curr_pos_id=curr_pos_id if use_kv_cache else None,
                     decode=decode,
@@ -350,7 +351,7 @@ class Engine:
         target_token_ids: torch.Tensor,
         prefill_token_ids: Optional[list[torch.Tensor]] = None,
         bounding_box_xyz: Optional[Tuple[float]] = None,
-        text_cond: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
         scheduled_sampling_p: float = 0.0,
     ) -> torch.Tensor:
         """
@@ -362,8 +363,7 @@ class Engine:
             prefill_token_ids (Optional[list[torch.Tensor]], optional): Known shape-token id
                 tensors to seed the context.
             bounding_box_xyz (Optional[Tuple[float]], optional): See run_gpt.
-            text_cond (Optional[torch.Tensor], optional): Precomputed text conditioning embeddings to reuse
-                instead of running the text encoder.
+            cond (Optional[torch.Tensor], optional): conditioning embeddings (e.g from CLIP or ShapeCondition)
             scheduled_sampling_p (float, optional): Probability in [0, 1] of feeding the model its
                 own predicted token instead of the ground-truth token at each fed-in position. 0.0
                 (default) is pure teacher forcing. When > 0, a first teacher-forced pass produces
@@ -372,13 +372,13 @@ class Engine:
             torch.Tensor: logits of shape [batch, self.max_new_tokens, num_codes], aligned
             position-for-position with target_token_ids (logits[:, k] predicts target_token_ids[:, k]).
         """
-        if text_cond is None:
-            embed, text_cond = self.prepare_inputs(
+        if cond is None:
+            embed, cond = self.prepare_inputs(
                 prompts, guidance_scale=0.0, bounding_box_xyz=bounding_box_xyz
             )
         else:
-            assert text_cond.shape[0] == target_token_ids.shape[0]
-            embed = self.encode_input(text_cond, self.gpt_model.shape_bos_id)
+            assert cond.shape[0] == target_token_ids.shape[0]
+            embed = self.encode_input(cond, self.gpt_model.shape_bos_id)
         batch_size, input_seq_len, dim = embed.shape
 
         prefill_embeds, n_prefill_tokens = self._encode_prefill(prefill_token_ids)
@@ -395,7 +395,7 @@ class Engine:
                 dim=1,
             )
             logits = self.gpt_model(
-                input_embeds, text_cond, kv_cache=None, curr_pos_id=None, decode=False
+                input_embeds, cond, kv_cache=None, curr_pos_id=None, decode=False
             )
             return logits[:, input_ctx_len - 1 :, self.min_id : self.max_id]
 

@@ -2,7 +2,7 @@ gpt_model:
   n_layer: 23
   n_single_layer: 1
   rope_theta: 10000
-  long_context_multiplier: 4.0
+  long_context_multiplier: 2.0
   n_head: 12
   n_embd: 1536
   bias: true

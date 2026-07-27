@@ -204,7 +204,7 @@ class OneDBottleNeck(nn.Module):
 
         self.block = block
 
-    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, dict, torch.Tensor]:
         """
         Forward pass of the OneDBottleNeck function.
         Args:
@@ -221,7 +221,7 @@ class OneDBottleNeck(nn.Module):
         z = h
         ret_dict = {}
         if self.block is not None:
-            z, d = self.block(z)
+            z, d, z_e_norm = self.block(z)
 
             key_mappings = {
                 "q": "indices",
@@ -231,7 +231,7 @@ class OneDBottleNeck(nn.Module):
                 if in_key in d:
                     ret_dict[out_key] = d[in_key]
 
-        return z, ret_dict
+        return z, ret_dict, z_e_norm
 
 
 class OneDDecoder(nn.Module):
@@ -513,11 +513,11 @@ class OneDAutoEncoder(nn.Module):
             z_e = z_e[:, 1:, ...]
 
         # quantize or kl
-        z, d = self.bottleneck(z_e)
+        z, d, z_e_norm = self.bottleneck(z_e)
 
         if self.cfg.encoder_with_cls_token:
             d["z_cls"] = z_cls
-        return z_e, z, None, d
+        return z_e, z, None, d, z_e_norm
 
     def decode(self, z: torch.Tensor):
         """
@@ -558,14 +558,15 @@ class OneDAutoEncoder(nn.Module):
                 - None: Placeholder for a potential future return value.
                 - logits (torch.Tensor): The logits generated from the queries and latents.
                 - d (torch.Tensor): Additional output from the encoding process.
+                - z_e_norm (torch.Tensor): The pre-quantized, normalized latent representation.
         """
 
-        _, z, _, d = self.encode(surface)
+        _, z, _, d, z_e_norm = self.encode(surface)
 
         latents = self.decode(z)
         logits = self.query(queries, latents)
 
-        return z, latents, None, logits, d
+        return z, latents, None, logits, d, z_e_norm
 
     @torch.no_grad()
     def extract_geometry(
