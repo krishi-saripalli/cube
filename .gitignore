@@ -174,3 +174,5 @@ cython_debug/
 # Output folder
 outputs/
 model_weights/
+
+weights/
