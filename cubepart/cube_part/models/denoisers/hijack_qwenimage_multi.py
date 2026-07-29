@@ -12,6 +12,7 @@ import torch.nn as nn
 from diffusers import AutoModel, QwenImageTransformer2DModel
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
+from cube_part.models.misc.embedding import SlotEmbedding
 from cube_part.models.transformers.gated_attention import QwenGatedTransformerBlock
 
 from .utils import _basic_init, _embed_init, _zero_init, replace_norm_with_fp32
@@ -124,7 +125,7 @@ def hijack_forward(
     if attention_kwargs is not None:
         attention_kwargs = attention_kwargs.copy()
 
-    hidden_states = self.img_in(hidden_states)
+    hidden_states = self.slot_embedding(self.img_in(hidden_states))
 
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -216,6 +217,7 @@ def build_qwenimage_multi_model(
     model_config["num_layers"] = num_layers
 
     model = QwenImageTransformer2DModel.from_config(model_config)
+    model.add_module("slot_embedding", SlotEmbedding(model.inner_dim))
 
     if multi_attention_layer_index is not None:
         multi_transformer_blocks = nn.ModuleList(

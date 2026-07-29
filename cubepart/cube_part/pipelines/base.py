@@ -10,3 +10,10 @@ class ShapeInput:
     latents: Optional[torch.Tensor] = (
         None  # pre-encoded shape latents (e.g. from ShapeDenoiserPipeline.encode_shape)
     )
+
+
+@dataclass
+class AnalogyShapeInput:
+    a: torch.Tensor
+    a_prime: torch.Tensor
+    b: torch.Tensor

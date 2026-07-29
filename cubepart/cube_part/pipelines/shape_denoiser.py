@@ -16,7 +16,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
 )
 from tqdm import tqdm
 
-from cube_part.pipelines.base import ShapeInput
+from cube_part.pipelines.base import AnalogyShapeInput, ShapeInput
 from cube_part.systems.shape_denoiser import ShapeDenoiserSystem
 from cube_part.utils.config import load_config
 from cube_part.utils.runtime import Benchmarker
@@ -156,6 +156,119 @@ class ShapeDenoiserPipeline:  # to be closer to diffusers
         else:
             sigmas = None
         return sigmas
+
+
+class AnalogyShapeDenoiserPipeline(ShapeDenoiserPipeline):
+    NUM_SHAPES = 4
+    TARGET_SLOT = 3
+
+    def check_inputs(self, shape_input: AnalogyShapeInput) -> None:
+        """Validate the three clean analogy latents."""
+        latents = (shape_input.a, shape_input.a_prime, shape_input.b)
+        if not all(isinstance(latent, torch.Tensor) for latent in latents):
+            raise TypeError("A, A-prime, and B latents must be tensors.")
+
+        expected_shape = (
+            self.system.shape_model.cfg.num_encoder_latents,
+            self.system.shape_model.cfg.embed_dim,
+        )
+        if any(latent.ndim != 3 for latent in latents):
+            raise ValueError(
+                "Analogy latents must have shape [batch, tokens, channels]."
+            )
+        if any(latent.shape[1:] != expected_shape for latent in latents):
+            raise ValueError(
+                f"Each analogy latent must end with shape {expected_shape}."
+            )
+        if any(latent.shape != latents[0].shape for latent in latents[1:]):
+            raise ValueError("A, A-prime, and B latents must have matching shapes.")
+
+    @torch.no_grad()
+    def input_to_analogy_shape(
+        self,
+        shape_input: AnalogyShapeInput,
+        resolution_base: float = 9.0,
+        chunk_size: int = 100_000,
+        seed: Optional[int] = 0,
+        scheduler_type: str = "dpm_solver",
+        timeshift: float = 1.0,
+        num_inference_steps: int = 50,
+        output_mesh: bool = True,
+        output_hidden_states: bool = False,
+    ):
+        """Generate B-prime from clean A, A-prime, and B latents."""
+        self.check_inputs(shape_input)
+        contexts = torch.stack(
+            [shape_input.a, shape_input.a_prime, shape_input.b], dim=1
+        )
+        contexts = contexts.to(device=self.device, dtype=torch.float32)
+        contexts = self.system._normalize_vae_latents(contexts)
+        batch_size, _, num_latents, _ = contexts.shape
+        target = self.prepare_latents(batch_size, num_latents, seed=seed)
+
+        prompts = [""] * (batch_size * self.NUM_SHAPES)
+        encoder_hidden_states, encoder_attention_mask = self.system.base_model(prompts)
+
+        side = math.isqrt(num_latents)
+        if side * side != num_latents:
+            raise ValueError("Shape RoPE requires a square number of latent tokens.")
+        img_shapes = [[(1, side, side)] * self.NUM_SHAPES]
+        noise_scheduler = self.prepare_noise_scheduler(
+            scheduler_type, timeshift=timeshift
+        )
+        sigmas = self.prepare_sigmas(scheduler_type, num_inference_steps)
+        timesteps, _ = retrieve_timesteps(
+            noise_scheduler,
+            num_inference_steps,
+            device=self.device,
+            sigmas=sigmas.tolist() if sigmas is not None else None,
+        )
+
+        noise_scheduler.set_begin_index(0)
+        for scheduler_timestep in tqdm(timesteps):
+            t = torch.as_tensor(
+                scheduler_timestep, device=self.device, dtype=target.dtype
+            )
+            slots = torch.cat([contexts, target.unsqueeze(1)], dim=1)
+            timestep = t.expand(encoder_hidden_states.shape[0]).to(target.dtype)
+
+            with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                model_pred = self.system._forward_diffusion_model(
+                    slots.flatten(0, 1),
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    img_shapes=img_shapes,
+                )
+                target_pred = model_pred.unflatten(0, (batch_size, self.NUM_SHAPES))[
+                    :, self.TARGET_SLOT
+                ].to(target.dtype)
+
+            velocity = (target - target_pred) / (
+                t / noise_scheduler.config["num_train_timesteps"]
+            ).clamp_min(self.system.cfg.timestep_eps)
+
+            target = noise_scheduler.step(
+                velocity,
+                t,
+                target,
+                return_dict=False,
+            )[0]
+
+        target = self.system._unnormalize_vae_latents(target)
+        if not output_mesh:
+            return target
+
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
+            mesh = self.decode_shape(
+                target.float(),
+                resolution_base=resolution_base,
+                chunk_size=chunk_size,
+            )
+
+        if output_hidden_states:
+            return mesh, target
+        return mesh
 
 
 class PartShapeDenoiserPipeline(ShapeDenoiserPipeline):

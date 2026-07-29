@@ -5,6 +5,7 @@ import torch.nn as nn
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 
+
 def build_condition_processor(model_type: str, **kwargs):
     if model_type.startswith("Qwen/Qwen3-VL"):
         return Qwen3VLProcessor(model_type, **kwargs)
